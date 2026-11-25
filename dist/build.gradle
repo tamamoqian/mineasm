@@ -1,0 +1,197 @@
+/*
+ * MineASM modpack packaging module
+ *
+ * Outputs:
+ *   1. mineasm-loader.jar - executable fat Jar merging core + all version adapters
+ *   2. mineasm-modpack-<arch>.zip - one runnable modpack per architecture:
+ *        loader/mineasm-loader.jar
+ *        native/<arch>/<native component>    (when the toolchain is available)
+ *        native/native-manifest.json        (when the toolchain is available)
+ *        mods/                               (mod placement directory)
+ *        launch-<arch>.sh / launch-<arch>.bat
+ *        README.txt
+ *   3. verifyCompatibility - full-version compatibility verification (12 cases, 1.7.2 ~ 1.21.1)
+ */
+plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation project(':core')
+    rootProject.subprojects { sub ->
+        if (sub.name.startsWith('adapter-')) {
+            implementation project(path: ":adapters:${sub.name}", configuration: 'default')
+        }
+    }
+}
+
+// ---- Executable fat Jar (merging core + all adapters) ----
+
+tasks.register('fatJar', Jar) {
+    group = 'mineasm'
+    description = 'Merge the loader core and all version adapters into a single executable Jar'
+    archiveFileName = "mineasm-loader-${project.version}.jar"
+    manifest {
+        attributes(
+            'Main-Class': 'com.mineasm.core.MineasmLoader',
+            'Implementation-Title': 'MineASM Loader',
+            'Implementation-Version': project.version,
+            'Supported-Architectures': 'x86_64,arm32,arm64',
+            'Supported-Versions': '1.7.x,1.12.x,1.13.x,1.14.x,1.15.x,1.16.x,1.17.x,1.18.x,1.19.x,1.20.x,1.21.x',
+        )
+    }
+    from sourceSets.main.output
+    dependsOn configurations.runtimeClasspath
+    from {
+        configurations.runtimeClasspath
+            .filter { it.name.endsWith('.jar') }
+            .collect { zipTree(it) }
+    } {
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA',
+                'META-INF/versions/**/module-info.class', 'module-info.class'
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// ---- Launch script generation ----
+
+def arches = ['x86_64', 'arm32', 'arm64']
+
+tasks.register('generateLaunchScripts') {
+    group = 'mineasm'
+    description = 'Generate launch scripts for the three architectures'
+    def outBase = layout.buildDirectory.dir('scripts')
+    outputs.dir outBase
+    doLast {
+        arches.each { arch ->
+            def dir = outBase.get().dir(arch).asFile
+            dir.mkdirs()
+
+            def sh = new File(dir, "launch-${arch}.sh")
+            sh.text = """#!/usr/bin/env bash
+# MineASM modpack launch script (${arch})
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+exec java -Dfile.encoding=UTF-8 -jar "\$DIR"/loader/mineasm-loader-*.jar \\
+    --arch ${arch} --mods-dir "\$DIR/mods" "\$@"
+"""
+            def bat = new File(dir, "launch-${arch}.bat")
+            bat.text = """@echo off
+rem MineASM modpack launch script (${arch})
+set DIR=%~dp0
+java -Dfile.encoding=UTF-8 -jar "%DIR%loader\\mineasm-loader-${project.version}.jar" --arch ${arch} --mods-dir "%DIR%mods" %*
+"""
+        }
+
+        def readme = new File(outBase.get().dir('_shared').asFile, 'README.txt')
+        readme.parentFile.mkdirs()
+        readme.text = """MineASM cross-architecture native mod modpack ${project.version}
+====================================================
+
+Directory layout:
+  loader/mineasm-loader.jar   Loader (core + all version adapters)
+  native/<arch>/              Native loader components for the matching
+                              architecture (NASM/GAS build output)
+  mods/                       Place Forge / NeoForge mod Jars here
+  launch-<arch>.sh|.bat       Launch scripts
+
+Usage:
+  ./launch-x86_64.sh  [--mc-version 1.20.1]
+  ./launch-arm64.bat  --mc-version 1.21.1
+
+Supported MC version families:
+  1.7.x 1.12.x 1.13.x 1.14.x 1.15.x 1.16.x 1.17.x 1.18.x 1.19.x 1.20.x 1.21.x
+"""
+    }
+}
+
+// ---- Per-architecture modpacks ----
+
+def nativeManifestTask = tasks.register('collectNativeManifest') {
+    group = 'mineasm'
+    description = 'Collect the native component manifest (depends on :native:nativeManifest)'
+    dependsOn ':native:nativeManifest'
+    doLast {
+        def mf = rootProject.file('native/build/native/native-manifest.json')
+        if (mf.exists()) {
+            def outDir = layout.buildDirectory.dir('modpack/_shared/native').get().asFile
+            outDir.mkdirs()
+            copy {
+                from mf
+                into outDir
+            }
+        }
+    }
+}
+
+arches.each { arch ->
+    tasks.register("packageModpack_${arch}", Zip) {
+        group = 'mineasm'
+        description = "Package the ${arch} modpack"
+        dependsOn 'fatJar', 'generateLaunchScripts', 'collectNativeManifest'
+        archiveFileName = "mineasm-modpack-${arch}-${project.version}.zip"
+        destinationDirectory = layout.buildDirectory.dir('distributions')
+
+        // Loader
+        from(tasks.named('fatJar')) {
+            into 'loader'
+        }
+        // Native components (this architecture only; omitted automatically when
+        // the toolchain is unavailable and the directory does not exist)
+        from(rootProject.file("native/build/native/${arch}")) {
+            include '*.dll', '*.so', '*.dylib'
+            into "native/${arch}"
+        }
+        // Native manifest
+        from(layout.buildDirectory.dir('modpack/_shared/native')) {
+            include 'native-manifest.json'
+            into 'native'
+        }
+        // Mods directory (empty directory + instructions)
+        from(layout.buildDirectory.dir('scripts/_shared')) {
+            include 'README.txt'
+        }
+        from(rootProject.file('docs')) {
+            include 'COMPATIBILITY.md', 'ARCHITECTURES.md'
+        }
+        // Launch scripts
+        from(layout.buildDirectory.dir("scripts/${arch}"))
+        // Placeholder mods directory (drop an instruction file; Zip keeps no empty dirs)
+        doFirst {
+            def modsDir = layout.buildDirectory.dir("modpack/${arch}/mods").get().asFile
+            modsDir.mkdirs()
+            new File(modsDir, 'PUT-MODS-HERE.txt').text = 'Place Forge / NeoForge mod Jars in this directory.\n'
+        }
+        from(layout.buildDirectory.dir("modpack/${arch}/mods")) {
+            into 'mods'
+        }
+    }
+}
+
+tasks.register('packageAll') {
+    group = 'mineasm'
+    description = 'Package modpacks for all three architectures'
+    dependsOn 'packageModpack_x86_64', 'packageModpack_arm32', 'packageModpack_arm64'
+}
+
+tasks.named('assemble') {
+    dependsOn 'packageAll'
+}
+
+// ---- Compatibility verification (1.7.2 ~ 1.21.1, all versions) ----
+
+tasks.register('verifyCompatibility', JavaExec) {
+    group = 'mineasm'
+    description = 'Run full Forge/NeoForge compatibility verification (12 generation cases)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.mineasm.core.CompatibilityVerifier'
+    jvmArgs '-Dfile.encoding=UTF-8'
+    outputs.upToDateWhen { false }
+}
+
+tasks.named('check') {
+    dependsOn 'verifyCompatibility'
+}
+
+tasks.named('build') {
+    dependsOn 'fatJar'
+}

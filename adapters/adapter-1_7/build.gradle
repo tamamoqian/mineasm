@@ -1,0 +1,6 @@
+/*
+ * adapter-1_7 - Forge 1.7.x (1.7.2 / 1.7.10) version adapter
+ */
+plugins { id 'java-library' }
+
+description = 'MineASM Forge 1.7.x version adapter'

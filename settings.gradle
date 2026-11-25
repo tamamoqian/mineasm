@@ -1,0 +1,21 @@
+/*
+ * MineASM - Cross-architecture native mod loader
+ * Gradle multi-project build entry point.
+ *
+ * Module layout (standard Gradle multi-project structure):
+ *   :native   - native compilation module (NASM x86_64 / GAS arm32 / GAS arm64)
+ *   :core     - loader core module (arch detection, JNI bridge, Jar scanning, adapter registry)
+ *   :adapters - Forge / NeoForge version adapter modules (11 subprojects, 1.7.x ~ 1.21.x)
+ *   :dist     - modpack packaging module (per-architecture runnable modpack output)
+ */
+rootProject.name = 'mineasm'
+
+include 'native'
+include 'core'
+include 'dist'
+
+def versionFamilies = ['1.7', '1.12', '1.13', '1.14', '1.15', '1.16',
+                       '1.17', '1.18', '1.19', '1.20', '1.21']
+versionFamilies.each { v ->
+    include "adapters:adapter-${v.replace('.', '_')}"
+}

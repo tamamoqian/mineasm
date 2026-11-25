@@ -1,0 +1,23 @@
+/*
+ * MineASM loader core module - build configuration
+ * Produces the loader core Jar (with Main-Class); referenced by the :dist modpack.
+ */
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    // The loader core intentionally has zero third-party dependencies so it can
+    // run on the minimal classpath of legacy MC versions.
+}
+
+jar {
+    manifest {
+        attributes(
+            'Main-Class': 'com.mineasm.core.MineasmLoader',
+            'Implementation-Title': 'MineASM Core Loader',
+            'Implementation-Version': project.version,
+            'Supported-Architectures': 'x86_64,arm32,arm64',
+        )
+    }
+}

@@ -1,0 +1,234 @@
+/*
+ * MineASM native compilation module
+ *
+ * Supported host OSes: Windows / Linux / macOS / FreeBSD / OpenBSD.
+ *
+ * Three target architectures:
+ *   x86_64 - NASM assembly (win64 / elf64 / macho64 output formats auto-matched to host OS;
+ *            FreeBSD and OpenBSD are ELF64, like Linux)
+ *   arm32  - GAS assembly (driven by arm-linux-gnueabihf-gcc, ARMv7-A / AAPCS)
+ *   arm64  - GAS assembly (driven by aarch64-linux-gnu-gcc, ARMv8-A / AAPCS64)
+ *
+ * Toolchain resolution order:
+ *   explicit mineasm.native.<arch>.assembler / linker paths in gradle.properties
+ *   -> PATH probing over candidate lists
+ *   -> none found: strict=true fails the build; otherwise the task is skipped with a warning.
+ *
+ * Outputs:
+ *   build/native/<arch>/mineasm_native.dll        (Windows x86_64)
+ *   build/native/<arch>/libmineasm_native.so      (Linux / FreeBSD / OpenBSD, all arches)
+ *   build/native/<arch>/libmineasm_native.dylib   (macOS x86_64 / arm64)
+ *   build/native/native-manifest.json             (consumed by :dist packaging)
+ */
+plugins {
+    id 'base'
+}
+
+ext {
+    osName = System.getProperty('os.name').toLowerCase()
+    isWindows = osName.contains('windows')
+    isMac = osName.contains('mac')
+    isFreeBsd = osName.contains('freebsd')
+    isOpenBsd = osName.contains('openbsd')
+    // FreeBSD / OpenBSD / NetBSD share the ELF + ld model; NetBSD is treated as BSD too
+    isBsd = isFreeBsd || isOpenBsd || osName.contains('netbsd')
+    strict = providers.gradleProperty('mineasm.native.strict').orElse('false').get().toBoolean()
+}
+
+// ---- Toolchain probing ----
+
+private String probeExecutable(String configured, List<String> candidates) {
+    if (configured && !configured.trim().isEmpty()) {
+        File f = new File(configured.trim())
+        if (f.isFile()) return f.absolutePath
+        if (which(configured.trim()) != null) return configured.trim()
+        return null
+    }
+    for (String c : candidates) {
+        def hit = which(c)
+        if (hit != null) return hit
+    }
+    return null
+}
+
+private String which(String name) {
+    try {
+        def exe = isWindows ? 'where.exe' : 'which'
+        Process p = new ProcessBuilder(exe, name).redirectErrorStream(true).start()
+        p.waitFor()
+        def out = p.inputStream.text.readLines().find { !it.trim().isEmpty() }
+        return p.exitValue() == 0 ? out?.trim() : null
+    } catch (Exception ignored) {
+        return null
+    }
+}
+
+// Per-architecture assembler/linker arguments (NASM/GAS flags and link rules)
+ext.archConfigs = [
+    x86_64: [
+        // NASM: -f output format varies with the host OS; win64 has no named
+        // debug format, ELF/Mach-O use dwarf. FreeBSD/OpenBSD/NetBSD are ELF64.
+        nasmFormat : isWindows ? 'win64' : (isMac ? 'macho64' : 'elf64'),
+        nasmFlags  : isWindows ? ['-g'] : ['-g', '-F', 'dwarf'],
+        srcDir     : 'src/asm/x86_64',
+        srcInclude : '*.asm',
+        linkCandidates : isWindows
+                ? ['x86_64-w64-mingw32-gcc', 'gcc', 'clang']
+                : (isMac ? ['clang']
+                    : (isBsd ? ['cc', 'clang', 'gcc'] : ['gcc', 'clang'])),
+        libName : isWindows ? 'mineasm_native.dll'
+                : (isMac ? 'libmineasm_native.dylib' : 'libmineasm_native.so'),
+        linkerFlags : isWindows ? ['-shared', '-static-libgcc'] : ['-shared', '-fPIC'],
+    ],
+    arm32: [
+        // GAS: driven by a cross gcc, -c assembles without linking
+        // ('cc'/'clang'/'as' cover native armhf hosts such as ARM boards)
+        asmCandidates  : ['arm-linux-gnueabihf-gcc', 'arm-linux-gnueabi-gcc',
+                          'arm-none-linux-gnueabihf-gcc', 'arm-linux-androideabi-clang',
+                          'cc', 'clang', 'as'],
+        asmFlags       : ['-c', '-marm', '-mfpu=neon', '-g'],
+        srcDir         : 'src/asm/arm32',
+        srcInclude     : '*.S',
+        linkCandidates : ['arm-linux-gnueabihf-gcc', 'arm-linux-gnueabi-gcc',
+                          'cc', 'clang'],
+        libName        : 'libmineasm_native.so',
+        linkerFlags    : ['-shared'],
+    ],
+    arm64: [
+        // 'cc'/'clang' cover native AArch64 hosts (macOS Apple Silicon,
+        // OpenBSD/FreeBSD arm64); cross gcc prefixes cover Linux cross builds
+        asmCandidates  : ['aarch64-linux-gnu-gcc', 'aarch64-none-linux-gnu-gcc',
+                          'aarch64-linux-android-clang', 'cc', 'clang'],
+        asmFlags       : ['-c', '-march=armv8-a', '-g'],
+        srcDir         : 'src/asm/arm64',
+        srcInclude     : '*.S',
+        linkCandidates : ['aarch64-linux-gnu-gcc', 'aarch64-none-linux-gnu-gcc',
+                          'cc', 'clang'],
+        libName        : 'libmineasm_native.so',
+        linkerFlags    : ['-shared'],
+    ],
+]
+
+archConfigs.each { arch, cfg ->
+    def outDir = layout.buildDirectory.dir("native/${arch}")
+    def objDir = outDir.map { it.dir('obj') }
+    def libFile = outDir.map { it.file(cfg.libName) }
+
+    tasks.register("resolveToolchain_${arch}") {
+        group = 'mineasm'
+        description = "Probe native toolchain for ${arch} (NASM/GAS assembler and linker)"
+        doLast {
+            def assembler = probeExecutable(
+                providers.gradleProperty("mineasm.native.${arch}.assembler").orElse('').get(),
+                cfg.containsKey('nasmFormat') ? ['nasm'] : cfg.asmCandidates)
+            def linker = probeExecutable(
+                providers.gradleProperty("mineasm.native.${arch}.linker").orElse('').get(),
+                cfg.linkCandidates)
+            def missing = []
+            if (assembler == null) missing << "assembler(${cfg.containsKey('nasmFormat') ? 'nasm' : cfg.asmCandidates[0]})"
+            if (linker == null) missing << "linker(${cfg.linkCandidates[0]})"
+            if (missing) {
+                def msg = "[native:${arch}] toolchain missing: ${missing.join(', ')}"
+                if (strict) {
+                    throw new GradleException(msg + " - strict mode aborts the build; install the toolchain or configure the path in gradle.properties.")
+                }
+                logger.lifecycle("${msg}; skipping native compilation for this architecture.")
+            } else {
+                logger.lifecycle("[native:${arch}] toolchain ready: assembler=${assembler}, linker=${linker}")
+            }
+            ext.assembler = assembler
+            ext.linker = linker
+        }
+    }
+
+    def compileTask = tasks.register("compile${arch}Asm", Exec) {
+        group = 'mineasm'
+        description = "Compile ${arch} assembly sources (${cfg.containsKey('nasmFormat') ? 'NASM' : 'GAS'})"
+        dependsOn "resolveToolchain_${arch}"
+        inputs.files fileTree(dir: cfg.srcDir, include: cfg.srcInclude)
+        outputs.file objDir.map { it.file('loader_entry.o') }
+        doFirst {
+            def tc = tasks.getByName("resolveToolchain_${arch}")
+            def assembler = tc.ext.assembler
+            if (assembler == null) throw new StopExecutionException()
+            objDir.get().asFile.mkdirs()
+            def srcs = fileTree(dir: cfg.srcDir, include: cfg.srcInclude).files.toList()
+            if (cfg.containsKey('nasmFormat')) {
+                commandLine assembler, '-f', cfg.nasmFormat, *cfg.nasmFlags, '-o', objDir.get().file('loader_entry.o').asFile, *srcs
+            } else {
+                // GAS: driven by a cross gcc, -c assembles to an object file
+                commandLine assembler, *cfg.asmFlags, '-o', objDir.get().file('loader_entry.o').asFile, *srcs
+            }
+            logger.lifecycle("[native:${arch}] ${commandLine.join(' ')}")
+        }
+        // Skip (instead of failing) when the toolchain is missing
+        onlyIf { tasks.getByName("resolveToolchain_${arch}").ext.assembler != null }
+    }
+
+    def linkTask = tasks.register("link${arch}Lib", Exec) {
+        group = 'mineasm'
+        description = "Link ${arch} native shared library ${cfg.libName}"
+        dependsOn "resolveToolchain_${arch}", compileTask
+        inputs.file objDir.map { it.file('loader_entry.o') }
+        outputs.file libFile
+        onlyIf {
+            tasks.getByName("resolveToolchain_${arch}").ext.linker != null &&
+                objDir.get().file('loader_entry.o').asFile.exists()
+        }
+        doFirst {
+            def linker = tasks.getByName("resolveToolchain_${arch}").ext.linker
+            outDir.get().asFile.mkdirs()
+            commandLine linker, *cfg.linkerFlags,
+                '-o', libFile.get().asFile.absolutePath,
+                objDir.get().file('loader_entry.o').asFile.absolutePath
+            logger.lifecycle("[native:${arch}] ${commandLine.join(' ')}")
+        }
+    }
+
+    ext."compileTask_${arch}" = compileTask
+    ext."linkTask_${arch}" = linkTask
+}
+
+// ---- Aggregation and manifest ----
+
+tasks.register('buildAllArchs') {
+    group = 'mineasm'
+    description = 'Assemble and link native loader components for all three architectures'
+    dependsOn 'linkx86_64Lib', 'linkarm32Lib', 'linkarm64Lib'
+}
+
+tasks.register('nativeManifest') {
+    group = 'mineasm'
+    description = 'Generate the native component manifest (native-manifest.json) for :dist packaging'
+    dependsOn 'buildAllArchs'
+    def manifestFile = layout.buildDirectory.file('native/native-manifest.json')
+    outputs.file manifestFile
+    doLast {
+        def archStates = [:]
+        archConfigs.each { arch, cfg ->
+            def lib = layout.buildDirectory.file("native/${arch}/${cfg.libName}").get().asFile
+            archStates[arch] = [
+                'library'  : cfg.libName,
+                'built'    : lib.exists(),
+                'path'     : lib.exists() ? lib.absolutePath : null,
+                'toolchain': [
+                    'assembler': tasks.getByName("resolveToolchain_${arch}").ext.assembler,
+                    'linker'   : tasks.getByName("resolveToolchain_${arch}").ext.linker,
+                ],
+            ]
+        }
+        def mf = manifestFile.get().asFile
+        mf.parentFile.mkdirs()
+        mf.text = groovy.json.JsonOutput.prettyPrint(
+            groovy.json.JsonOutput.toJson([
+                'version'    : project.version,
+                'abi'        : '0x0100',
+                'architectures': archStates,
+            ]))
+        logger.lifecycle("[native] manifest generated: ${mf}")
+    }
+}
+
+tasks.named('build') {
+    dependsOn 'nativeManifest'
+}

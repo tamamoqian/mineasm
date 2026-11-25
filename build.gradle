@@ -1,0 +1,65 @@
+/*
+ * MineASM root build script
+ * Unified Java compilation settings, encoding, repositories and aggregate tasks
+ * for all subprojects.
+ */
+
+allprojects {
+    group = 'com.mineasm'
+    version = '1.0.0'
+
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects { sub ->
+    plugins.withId('java') {
+        java {
+            // The loader must run on both legacy MC runtimes (Java 6/8) and modern
+            // ones (Java 17/21), so bytecode uniformly targets Java 8.
+            sourceCompatibility = JavaVersion.VERSION_1_8
+            targetCompatibility = JavaVersion.VERSION_1_8
+        }
+
+        tasks.withType(JavaCompile).configureEach {
+            options.encoding = 'UTF-8'
+            options.warnings = false
+        }
+
+        tasks.withType(Javadoc).configureEach {
+            options.encoding = 'UTF-8'
+            failOnError = false
+        }
+
+        tasks.withType(Jar).configureEach {
+            preserveFileTimestamps = false
+            reproducibleFileOrder = true
+        }
+    }
+
+    // Version adapter subproject convention: java-library + dependency on :core
+    if (sub.name.startsWith('adapter-')) {
+        apply plugin: 'java-library'
+        dependencies {
+            api project(':core')
+        }
+    }
+}
+
+/*
+ * Aggregate tasks:
+ *   ./gradlew buildAll  - native components for all architectures + Java loader + modpacks
+ *   ./gradlew verifyAll - compatibility verification for all Forge/NeoForge versions
+ */
+tasks.register('buildAll') {
+    group = 'mineasm'
+    description = 'Build native loader components for all architectures and all modpacks'
+    dependsOn ':native:buildAllArchs', ':dist:packageAll'
+}
+
+tasks.register('verifyAll') {
+    group = 'mineasm'
+    description = 'Run all compatibility verification checks (Forge/NeoForge version adapters)'
+    dependsOn ':dist:verifyCompatibility'
+}

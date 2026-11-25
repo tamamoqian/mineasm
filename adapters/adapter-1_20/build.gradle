@@ -1,0 +1,7 @@
+/*
+ * adapter-1_20 - Forge / NeoForge 1.20.1 version adapters
+ * (NeoForge forked from Forge at 1.20.1; both share the mods.toml metadata)
+ */
+plugins { id 'java-library' }
+
+description = 'MineASM Forge/NeoForge 1.20.1 version adapter'

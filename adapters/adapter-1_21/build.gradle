@@ -1,0 +1,7 @@
+/*
+ * adapter-1_21 - Forge / NeoForge 1.21.1 version adapters
+ * (NeoForge 1.20.4+ uses META-INF/neoforge.mods.toml)
+ */
+plugins { id 'java-library' }
+
+description = 'MineASM Forge/NeoForge 1.21.1 version adapter'

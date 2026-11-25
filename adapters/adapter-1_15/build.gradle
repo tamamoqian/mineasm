@@ -1,0 +1,6 @@
+/*
+ * adapter-1_15 - Forge 1.15.2 version adapter
+ */
+plugins { id 'java-library' }
+
+description = 'MineASM Forge 1.15.2 version adapter'
